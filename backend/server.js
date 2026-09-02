@@ -10,6 +10,10 @@ import openai from "./ai.js";
 import { Chat } from "./models/chat.js";
 import { User } from "./models/user.js";
 import { connectDB } from "./utils/features.js";
+import session from "express-session";
+import passport from "passport";
+import { Strategy as GoogleStrategy } from "passport-google-oauth20";
+
 import cookieParser from "cookie-parser";
 dotenv.config();
 const JWT_SECRET = process.env.JWT_SECRET;
@@ -25,13 +29,19 @@ console.log("MONGO_URI", MONGO_URI);
 app.use(express.json());
 // Enable CORS
 
-app.use(cors());
 const cookieOptions = {
   httpOnly: true,
   maxAge: 15 * 24 * 60 * 60 * 1000,
   sameSite: "Lax",
   secure: false,
 };
+app.use(
+  cors({
+    origin: "http://localhost:5173", // Your frontend URL
+    methods: ["GET", "POST"],
+    credentials: true, // Allow sending cookies
+  })
+);
 // Create a WebSocket server
 const io = new Server(server, {
   cors: {
@@ -40,7 +50,18 @@ const io = new Server(server, {
     credentials: true,
   },
 });
+
 app.use(cookieParser());
+app.use(
+  session({
+    secret: process.env.SESSION_SECRET,
+    resave: false,
+    saveUninitialized: true,
+  })
+);
+
+app.use(passport.initialize());
+app.use(passport.session());
 // 🔹 Signup API
 app.post("/register", async (req, res) => {
   try {
@@ -50,8 +71,10 @@ app.post("/register", async (req, res) => {
 
     const newUser = new User({ username, email, password: hashedPassword });
     await newUser.save();
-
-    res.json({ message: "User registered successfully!" });
+    const token = generateToken(newUser);
+    res
+      .cookie("userToken", token, { httpOnly: true, secure: false })
+      .json({ message: "User registered", token });
   } catch (error) {
     res.status(500).json({ error: "Error registering user" });
   }
@@ -77,9 +100,93 @@ app.post("/login", async (req, res) => {
     res.status(500).json({ error: "Error logging in" });
   }
 });
+
+app.get("/auth/status", (req, res) => {
+  const token = req.cookies.userToken;
+
+  if (!token) {
+    return res.status(401).json({ authenticated: false, user: null });
+  }
+
+  try {
+    const decoded = jwt.verify(token, process.env.JWT_SECRET);
+    res.json({ authenticated: true, user: decoded });
+  } catch (error) {
+    res.status(401).json({ authenticated: false, user: null });
+  }
+});
+
+passport.use(
+  new GoogleStrategy(
+    {
+      clientID: process.env.GOOGLE_CLIENT_ID,
+      clientSecret: process.env.GOOGLE_CLIENT_SECRET,
+      callbackURL: "/auth/google/callback",
+    },
+    async (accessToken, refreshToken, profile, done) => {
+      try {
+        const email = profile.emails[0].value;
+
+        // Check if the user exists by email
+        let user = await User.findOne({ email });
+
+        if (user) {
+          // If the user exists but does not have a Google ID, update it
+          if (!user.googleId) {
+            user.googleId = profile.id;
+            await user.save();
+          }
+          return done(null, user);
+        }
+
+        // If the user does not exist, create a new Google user
+        user = new User({
+          googleId: profile.id,
+          email,
+          username: profile.displayName.replace(/\s+/g, "").toLowerCase(), // Generate a username
+        });
+
+        await user.save();
+        return done(null, user);
+      } catch (error) {
+        return done(error, null);
+      }
+    }
+  )
+);
+
+// 🔹 Serialize & Deserialize User
+passport.serializeUser((user, done) => {
+  done(null, user);
+});
+passport.deserializeUser((obj, done) => {
+  done(null, obj);
+});
+
+// 🔹 Google Login Route
+app.get(
+  "/auth/google",
+  passport.authenticate("google", { scope: ["profile", "email"] })
+);
+
+app.get(
+  "/auth/google/callback",
+  passport.authenticate("google", { failureRedirect: "/" }),
+  async (req, res) => {
+    const token = jwt.sign({ userId: req.user._id }, JWT_SECRET, {
+      expiresIn: "7d",
+    });
+    // const token = (req.user);
+    res.cookie("userToken", token, { httpOnly: true, secure: false });
+    res.redirect(`${process.env.FRONTEND_URL}`);
+  }
+);
+
 // 🔹 Middleware for Protected Routes
 const authenticate = (req, res, next) => {
+  console.log("authenticate");
   const token = req.cookies.userToken;
+  // console.log("token", token);
   if (!token) return res.status(403).json({ error: "Access denied" });
 
   try {
@@ -94,7 +201,8 @@ const authenticate = (req, res, next) => {
 
 app.post("/start-chat", authenticate, async (req, res) => {
   try {
-    const { dob, time, name, place } = req.body;
+    const { dob, time, name = "demo", place } = req.body;
+    // console.log("req.body", req.body);
     const userId = req.user;
     console.log("userId", userId);
     // Close any existing session for the user
@@ -102,19 +210,27 @@ app.post("/start-chat", authenticate, async (req, res) => {
       { userId, status: "active" },
       { status: "completed" }
     );
+    console.log(place);
+   const placee=place.value;
+    console.log(placee);
     console.log(req.body);
-    const astrologyData = await axios.post(
-      "https://roxyapi.com/api/v1/data/astro/astrology/birth-chart",
-      { name, birthdate: dob, time_of_birth: time },
-      { headers: { "x-api-key": ROXY_API_KEY } }
-    );
+    const astrologyData = await axios
+      .post(
+        "https://roxyapi.com/api/v1/data/astro/astrology/birth-chart",
+        { name, birthdate: dob, time_of_birth: time },
+        { headers: { "x-api-key": ROXY_API_KEY } }
+      )
+      .catch((error) => {
+        console.error("Error with RoxyAPI:", error);
+        return res.status(500).json({ error: "Error fetching astrology data" });
+      });
     console.log(astrologyData.data);
     // Create a new session
     const newSession = new Chat({
       userId,
       dob,
       time,
-      place,
+      placee,
       chatHistory: [],
       astroData: astrologyData.data,
     });
@@ -283,10 +399,14 @@ const getAIResponse = async ({ userMessage, sessionId }) => {
 };
 
 app.get("/", authenticate, (req, res) => {
+  console.log("dsd");
   res.send("Server is running");
   console.log(req.user);
 });
-
+app.get("/logout", (req, res) => {
+  res.clearCookie("userToken");
+  res.json({ message: "Logged out successfully" });
+});
 // Test astrology API route
 app.get("/news", async (req, res) => {
   const response = await axios(

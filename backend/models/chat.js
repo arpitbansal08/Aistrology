@@ -4,7 +4,7 @@ const ChatSchema = new mongoose.Schema({
   userId: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
   dob: { type: String, required: true },
   time: { type: String, required: true },
-  place: { type: String, required: true },
+  placee: { type: String, required: true },
   chatHistory: [
     {
       sender: { type: String, enum: ["user", "ai"], required: true },
